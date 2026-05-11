@@ -1,32 +1,31 @@
-# Aplikasi Streamlit Harga Harian Telur & Daging Ayam
+# Pantau Harga Telur & Daging Ayam Harian
 
-Aplikasi ini digunakan untuk mencatat harga harian:
+Aplikasi Streamlit untuk mengambil dan menyimpan harga harian **Telur Ayam Ras** dan **Daging Ayam Ras** ke tabel lokal.
 
-- Telur Ayam Ras
-- Daging Ayam / Ayam Broiler
+## Fitur
 
-Fitur utama:
+- Ambil harga otomatis dari beberapa sumber publik:
+  - SP2KP Kemendag Nasional
+  - DPKP DIY
+  - Dataku Salatiga
+- Input manual bila sumber otomatis gagal.
+- Simpan data ke `data/harga_telur_ayam.csv`.
+- Tampilkan tabel, grafik tren, dan tombol download CSV/Excel.
+- Mekanisme `upsert`: data dengan tanggal dan sumber yang sama akan diperbarui, bukan diduplikasi.
 
-- Ambil harga otomatis dari sumber publik.
-- Sumber otomatis utama: Simponi Ternak Kementan.
-- Sumber cadangan: SP2KP Kemendag dan PIHPS BI.
-- Input manual jika scraping otomatis gagal.
-- Simpan data ke `data/harga_harian.csv`.
-- Tampilkan tabel, grafik, dan download CSV/Excel.
+## Cara Menjalankan
 
-## Cara menjalankan
-
-1. Ekstrak ZIP.
-2. Buka terminal di folder hasil ekstrak.
-3. Jalankan:
+1. Ekstrak file ZIP.
+2. Buka terminal di folder proyek.
+3. Jalankan perintah berikut:
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Catatan penting
+## Catatan Penting
 
-Situs publik dapat berubah struktur HTML atau memuat data lewat JavaScript. Karena itu, aplikasi ini menyediakan input manual agar tabel tetap bisa digunakan meskipun sumber otomatis sedang berubah atau maintenance.
+Situs sumber harga publik dapat berubah struktur atau memblokir request otomatis. Jika muncul error seperti `403 Forbidden`, gunakan mode **Manual** atau sesuaikan fungsi `fetch_*` di `app.py`.
 
-Untuk sumber Simponi Ternak, komoditas `Ayam Broiler` digunakan sebagai padanan harga daging ayam.
+Versi ini **tidak lagi menggunakan Simponi Ternak Kementan** karena situs tersebut sering menolak request otomatis dengan error `403 Forbidden`.
