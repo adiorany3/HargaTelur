@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import io
 import re
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -16,28 +17,54 @@ APP_TIMEZONE = "Asia/Jakarta"
 DATA_DIR = Path("data")
 DATA_FILE = DATA_DIR / "harga_harian.csv"
 
+SIMPONI_URL = "https://simponiternak.pertanian.go.id/harga-daerah.php"
 SP2KP_URL = "https://sp2kp.kemendag.go.id/"
 PIHPS_URL = "https://www.bi.go.id/hargapangan"
 
+BASE_COLUMNS = [
+    "tanggal",
+    "komoditas",
+    "harga_rp_per_kg",
+    "satuan",
+    "sumber",
+    "catatan",
+    "waktu_input",
+]
+
+DISPLAY_COMMODITIES = ["Telur Ayam Ras", "Daging Ayam / Ayam Broiler"]
+
 COMMODITY_ALIASES = {
-    "Telur Ayam Ras": [
-        "Telur Ayam Ras",
-        "Telur Ayam Ras Segar",
-        "Telur",
-    ],
-    "Daging Ayam Ras": [
+    "Telur Ayam Ras": ["Telur Ayam Ras", "Telur Ayam Ras Segar", "Telur"],
+    "Daging Ayam / Ayam Broiler": [
         "Daging Ayam Ras",
         "Daging Ayam Ras Segar",
+        "Ayam Broiler",
+        "Daging Ayam",
         "Ayam Ras",
     ],
 }
 
-BASE_COLUMNS = ["tanggal", "komoditas", "harga_rp_per_kg", "satuan", "sumber", "catatan", "waktu_input"]
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 
 
-# -----------------------------
-# Utilitas data
-# -----------------------------
+@dataclass(frozen=True)
+class SourceConfig:
+    label: str
+    url: str
+    fetcher: Callable[[date], pd.DataFrame]
+
+
+# =============================
+# Utilitas tanggal dan data lokal
+# =============================
 def today_jakarta() -> date:
     return datetime.now(ZoneInfo(APP_TIMEZONE)).date()
 
@@ -84,17 +111,12 @@ def upsert_rows(new_rows: pd.DataFrame) -> pd.DataFrame:
         subset=["tanggal", "komoditas", "sumber"],
         keep="last",
     )
-    combined = combined.sort_values(["tanggal", "komoditas"], ascending=[False, True])
+    combined = combined.sort_values(["tanggal", "komoditas", "sumber"], ascending=[False, True, True])
     save_data(combined)
     return combined
 
 
-def build_rows(
-    prices: dict[str, int],
-    selected_date: date,
-    source: str,
-    note: str = "",
-) -> pd.DataFrame:
+def build_rows(prices: dict[str, int], selected_date: date, source: str, note: str = "") -> pd.DataFrame:
     now = datetime.now(ZoneInfo(APP_TIMEZONE)).isoformat(timespec="seconds")
     rows = []
     for commodity, price in prices.items():
@@ -114,15 +136,19 @@ def build_rows(
     return pd.DataFrame(rows, columns=BASE_COLUMNS)
 
 
-# -----------------------------
+# =============================
 # Utilitas parsing harga
-# -----------------------------
+# =============================
+def normalize_space(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
 def normalize_text(value: object) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+    return normalize_space(value).lower()
 
 
 def parse_rupiah(value: object) -> Optional[int]:
-    """Konversi teks harga seperti 'Rp 37.643' atau '28.536,00' menjadi integer."""
+    """Konversi teks harga seperti 'Rp 37.643', '37,643', atau '28.536,00' menjadi integer."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
 
@@ -137,43 +163,168 @@ def parse_rupiah(value: object) -> Optional[int]:
         if not s:
             continue
 
-        # Heuristik pemisah ribuan/desimal Indonesia dan internasional.
         if "," in s and "." in s:
             if s.rfind(",") > s.rfind("."):
-                # 28.536,00 -> 28536
+                # Format Indonesia: 28.536,00
                 s = s.replace(".", "")
                 s = s.split(",")[0]
             else:
-                # 28,536.00 -> 28536
+                # Format internasional: 28,536.00
                 s = s.replace(",", "")
                 s = s.split(".")[0]
         elif "," in s:
+            # Untuk situs Indonesia, 25,533 umumnya berarti 25.533.
             parts = s.split(",")
-            if len(parts[-1]) <= 2:
-                s = "".join(parts[:-1]) or parts[0]
+            if len(parts[-1]) == 3:
+                s = "".join(parts)
+            elif len(parts[-1]) <= 2 and len(parts) == 2:
+                # Kemungkinan desimal: 28536,00
+                s = parts[0]
             else:
                 s = "".join(parts)
         elif "." in s:
             parts = s.split(".")
             if len(parts[-1]) == 3:
                 s = "".join(parts)
-            elif len(parts[-1]) <= 2:
-                s = "".join(parts[:-1]) or parts[0]
+            elif len(parts[-1]) <= 2 and len(parts) == 2:
+                # Kemungkinan desimal: 28536.00
+                s = parts[0]
             else:
                 s = "".join(parts)
 
         digits = re.sub(r"\D", "", s)
-        if digits:
-            number = int(digits)
-            # Batas wajar harga pangan per kg agar tanggal/tahun tidak ikut terambil.
-            if 5_000 <= number <= 250_000:
-                candidates.append(number)
+        if not digits:
+            continue
 
-    if not candidates:
-        return None
+        number = int(digits)
+        # Batas wajar harga pangan per kg agar tanggal/tahun tidak ikut terambil.
+        if 5_000 <= number <= 250_000:
+            candidates.append(number)
 
-    # Biasanya harga adalah kandidat terbesar pada baris komoditas.
-    return max(candidates)
+    return candidates[-1] if candidates else None
+
+
+def request_html(url: str) -> str:
+    response = requests.get(url, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    if not response.text.strip():
+        raise RuntimeError("Respons halaman kosong.")
+    return response.text
+
+
+def soup_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    return normalize_space(soup.get_text(" "))
+
+
+def parse_indonesian_date(raw: str) -> Optional[date]:
+    raw = raw.strip()
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def nearest_date_index(dates: list[date], selected_date: date) -> int:
+    if selected_date in dates:
+        return dates.index(selected_date)
+    # Bila tanggal pilihan tidak muncul di tabel sumber, pakai tanggal terbaru yang tersedia.
+    return len(dates) - 1
+
+
+def extract_prices_from_simponi_text(text: str, selected_date: date) -> tuple[dict[str, int], date, str]:
+    """Parser khusus tabel Simponi Ternak.
+
+    Halaman default berisi tabel 7 hari terakhir dengan baris komoditas.
+    Kita ambil Telur Ayam Ras dan Ayam Broiler sebagai padanan daging ayam.
+    """
+    if "No Komoditas" not in text:
+        raise RuntimeError("Tabel 'No Komoditas' tidak ditemukan pada halaman Simponi Ternak.")
+
+    table_text = text.split("No Komoditas", 1)[1]
+    raw_dates = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", table_text)
+    dates: list[date] = []
+    for raw in raw_dates:
+        parsed = parse_indonesian_date(raw)
+        if parsed and parsed not in dates:
+            dates.append(parsed)
+
+    if not dates:
+        raise RuntimeError("Header tanggal pada tabel Simponi Ternak tidak ditemukan.")
+
+    date_idx = nearest_date_index(dates, selected_date)
+    actual_date = dates[date_idx]
+
+    # Daftar nama baris dipakai untuk membatasi segmen agar angka dari baris berikutnya tidak ikut terbaca.
+    source_rows = [
+        "Sapi",
+        "Kerbau",
+        "Kambing",
+        "Domba",
+        "Telur Ayam Ras",
+        "Telur Ayam Buras",
+        "Telur Itik",
+        "Susu Segar",
+        "Ayam Broiler",
+        "Ayam Buras",
+        "Itik",
+        "Babi",
+    ]
+
+    positions: list[tuple[int, str]] = []
+    for label in source_rows:
+        match = re.search(rf"\b{re.escape(label)}\b", table_text, flags=re.IGNORECASE)
+        if match:
+            positions.append((match.start(), label))
+    positions.sort()
+
+    def segment_for(label: str) -> str:
+        for idx, (pos, current_label) in enumerate(positions):
+            if current_label.lower() == label.lower():
+                end = positions[idx + 1][0] if idx + 1 < len(positions) else len(table_text)
+                return table_text[pos:end]
+        return ""
+
+    def price_for(label: str) -> Optional[int]:
+        segment = segment_for(label)
+        if not segment:
+            return None
+        numbers = re.findall(r"\d[\d\.,]*", segment)
+        parsed_numbers: list[int] = []
+        for raw_num in numbers:
+            parsed = parse_rupiah(raw_num)
+            if parsed is not None:
+                parsed_numbers.append(parsed)
+        if len(parsed_numbers) <= date_idx:
+            return None
+        return parsed_numbers[date_idx]
+
+    prices: dict[str, int] = {}
+    telur = price_for("Telur Ayam Ras")
+    ayam = price_for("Ayam Broiler")
+    if telur is not None:
+        prices["Telur Ayam Ras"] = telur
+    if ayam is not None:
+        prices["Daging Ayam / Ayam Broiler"] = ayam
+
+    if not prices:
+        raise RuntimeError("Harga Telur Ayam Ras dan Ayam Broiler tidak berhasil dibaca dari Simponi Ternak.")
+
+    if actual_date != selected_date:
+        note = f"Tanggal {selected_date:%Y-%m-%d} tidak ada pada tabel sumber; memakai tanggal terbaru tersedia {actual_date:%Y-%m-%d}."
+    else:
+        note = "Diambil otomatis dari tabel Simponi Ternak. Ayam Broiler dipakai sebagai padanan harga daging ayam."
+
+    return prices, actual_date, note
+
+
+def fetch_simponi_prices(selected_date: date) -> pd.DataFrame:
+    html = request_html(SIMPONI_URL)
+    text = soup_text(html)
+    prices, actual_date, note = extract_prices_from_simponi_text(text, selected_date)
+    return build_rows(prices, actual_date, "Simponi Ternak Kementan", note)
 
 
 def row_contains_alias(row_text: str, aliases: Iterable[str]) -> bool:
@@ -189,7 +340,6 @@ def extract_from_html_tables(html: str) -> dict[str, int]:
         tables = []
 
     for table in tables:
-        # Ubah semua cell menjadi teks agar pencarian fleksibel.
         table = table.fillna("")
         for _, row in table.iterrows():
             row_text = " | ".join(str(x) for x in row.tolist())
@@ -197,29 +347,23 @@ def extract_from_html_tables(html: str) -> dict[str, int]:
                 if commodity in results:
                     continue
                 if row_contains_alias(row_text, aliases):
-                    # Cari angka harga dari seluruh cell dalam baris.
                     price_candidates = []
                     for cell in row.tolist():
                         parsed = parse_rupiah(cell)
                         if parsed is not None:
                             price_candidates.append(parsed)
                     if price_candidates:
-                        results[commodity] = max(price_candidates)
-
+                        results[commodity] = price_candidates[-1]
     return results
 
 
 def extract_from_plain_text(html: str) -> dict[str, int]:
-    """Fallback bila data tidak terbaca sebagai tabel HTML."""
-    soup = BeautifulSoup(html, "html.parser")
-    text = re.sub(r"\s+", " ", soup.get_text(" ")).strip()
+    text = soup_text(html)
     results: dict[str, int] = {}
-
     for commodity, aliases in COMMODITY_ALIASES.items():
         for alias in aliases:
-            # Ambil harga yang posisinya dekat dengan nama komoditas.
             pattern = re.compile(
-                rf"{re.escape(alias)}.{{0,120}}?(?:Rp\s*)?(\d[\d\.,]*)",
+                rf"{re.escape(alias)}.{{0,100}}?(?:Rp\s*)?(\d[\d\.,]*)",
                 flags=re.IGNORECASE,
             )
             match = pattern.search(text)
@@ -228,33 +372,24 @@ def extract_from_plain_text(html: str) -> dict[str, int]:
                 if price is not None:
                     results[commodity] = price
                     break
-
     return results
 
 
-def fetch_public_prices(url: str, source_name: str, selected_date: date) -> pd.DataFrame:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        )
-    }
-    response = requests.get(url, headers=headers, timeout=25)
-    response.raise_for_status()
-    html = response.text
-
+def fetch_generic_public_prices(url: str, source_name: str, selected_date: date) -> pd.DataFrame:
+    html = request_html(url)
     prices = extract_from_html_tables(html)
-    if len(prices) < len(COMMODITY_ALIASES):
-        prices.update({k: v for k, v in extract_from_plain_text(html).items() if k not in prices})
+    if len(prices) < len(DISPLAY_COMMODITIES):
+        fallback_prices = extract_from_plain_text(html)
+        for key, value in fallback_prices.items():
+            prices.setdefault(key, value)
 
     if not prices:
         raise RuntimeError(
-            "Harga tidak berhasil dibaca otomatis. Struktur halaman kemungkinan berubah atau data dimuat lewat JavaScript. "
-            "Gunakan form input manual, atau sesuaikan fungsi fetch_public_prices() dengan endpoint resmi terbaru."
+            "Harga tidak berhasil dibaca otomatis. Struktur halaman kemungkinan berubah, sedang maintenance, "
+            "atau data dimuat lewat JavaScript. Gunakan Simponi Ternak atau form input manual."
         )
 
-    missing = [commodity for commodity in COMMODITY_ALIASES if commodity not in prices]
+    missing = [commodity for commodity in DISPLAY_COMMODITIES if commodity not in prices]
     note = "Diambil otomatis dari halaman publik."
     if missing:
         note += " Komoditas belum terbaca: " + ", ".join(missing)
@@ -262,9 +397,24 @@ def fetch_public_prices(url: str, source_name: str, selected_date: date) -> pd.D
     return build_rows(prices, selected_date, source_name, note)
 
 
-# -----------------------------
+def fetch_sp2kp_prices(selected_date: date) -> pd.DataFrame:
+    return fetch_generic_public_prices(SP2KP_URL, "SP2KP Kemendag", selected_date)
+
+
+def fetch_pihps_prices(selected_date: date) -> pd.DataFrame:
+    return fetch_generic_public_prices(PIHPS_URL, "PIHPS BI", selected_date)
+
+
+SOURCE_CONFIGS = {
+    "Simponi Ternak Kementan": SourceConfig("Simponi Ternak Kementan", SIMPONI_URL, fetch_simponi_prices),
+    "SP2KP Kemendag": SourceConfig("SP2KP Kemendag", SP2KP_URL, fetch_sp2kp_prices),
+    "PIHPS BI": SourceConfig("PIHPS BI", PIHPS_URL, fetch_pihps_prices),
+}
+
+
+# =============================
 # UI Streamlit
-# -----------------------------
+# =============================
 def render_header() -> None:
     st.set_page_config(
         page_title="Harga Harian Telur & Daging Ayam",
@@ -274,25 +424,26 @@ def render_header() -> None:
     st.title("Pemantauan Harga Harian Telur & Daging Ayam")
     st.caption(
         "Aplikasi Streamlit untuk mengambil, menyimpan, menampilkan, dan mengunduh data harga harian "
-        "Telur Ayam Ras dan Daging Ayam Ras dalam tabel."
+        "Telur Ayam Ras dan Daging Ayam/Ayam Broiler dalam tabel."
     )
 
 
 def render_fetch_section() -> None:
     st.subheader("1. Ambil Harga Harian")
-    st.write(
-        "Pilih tanggal dan sumber. Jika pengambilan otomatis gagal karena struktur situs berubah, "
-        "gunakan bagian input manual di bawah."
+    st.info(
+        "Sumber utama otomatis: Simponi Ternak Kementan. SP2KP/PIHPS disediakan sebagai cadangan karena "
+        "sering memakai JavaScript atau berubah struktur halaman."
     )
 
-    col1, col2, col3 = st.columns([1, 1, 1])
+    col1, col2, col3 = st.columns([1, 1.4, 1])
     with col1:
         selected_date = st.date_input("Tanggal", value=today_jakarta(), format="YYYY-MM-DD")
     with col2:
-        source = st.selectbox(
+        source_label = st.selectbox(
             "Sumber otomatis",
-            ["SP2KP Kemendag", "PIHPS BI"],
-            help="SP2KP dipakai sebagai sumber utama. PIHPS disediakan sebagai opsi cadangan/eksperimental.",
+            list(SOURCE_CONFIGS.keys()),
+            index=0,
+            help="Gunakan Simponi Ternak lebih dulu. Jika gagal, isi manual atau coba sumber lain.",
         )
     with col3:
         st.write("")
@@ -302,28 +453,29 @@ def render_fetch_section() -> None:
     auto_fetch_today = st.toggle(
         "Ambil otomatis saat aplikasi dibuka jika data hari ini belum ada",
         value=False,
-        help="Aktifkan bila aplikasi dipakai sebagai pencatatan harian. Data tidak akan digandakan untuk tanggal, komoditas, dan sumber yang sama.",
+        help="Data tidak akan digandakan untuk tanggal, komoditas, dan sumber yang sama.",
     )
 
     data = load_data()
     has_today_for_source = False
     if not data.empty:
-        has_today_for_source = (
-            (data["tanggal"] == today_jakarta())
-            & (data["sumber"] == source)
-        ).any()
+        has_today_for_source = ((data["tanggal"] == today_jakarta()) & (data["sumber"] == source_label)).any()
 
     should_fetch = fetch_clicked or (auto_fetch_today and not has_today_for_source)
     if should_fetch:
-        url = SP2KP_URL if source == "SP2KP Kemendag" else PIHPS_URL
+        source = SOURCE_CONFIGS[source_label]
         try:
-            with st.spinner("Mengambil dan membaca harga dari sumber publik..."):
-                rows = fetch_public_prices(url, source, selected_date)
-                combined = upsert_rows(rows)
-            st.success(f"Berhasil menyimpan {len(rows)} baris data dari {source}.")
+            with st.spinner(f"Mengambil harga dari {source.label}..."):
+                rows = source.fetcher(selected_date)
+                upsert_rows(rows)
+            st.success(f"Berhasil menyimpan {len(rows)} baris data dari {source.label}.")
             st.dataframe(rows, use_container_width=True, hide_index=True)
-        except Exception as exc:  # noqa: BLE001 - ditampilkan agar pengguna tahu penyebabnya
+        except Exception as exc:  # noqa: BLE001 - sengaja ditampilkan agar pengguna tahu penyebabnya
             st.error(str(exc))
+            st.warning(
+                "Solusi cepat: pilih sumber 'Simponi Ternak Kementan' atau isi harga lewat form manual. "
+                "Data manual tetap masuk ke tabel dan bisa diunduh."
+            )
 
 
 def render_manual_input() -> None:
@@ -335,7 +487,7 @@ def render_manual_input() -> None:
         with col2:
             egg_price = st.number_input("Harga Telur Ayam Ras / kg", min_value=0, step=500, value=0)
         with col3:
-            chicken_price = st.number_input("Harga Daging Ayam Ras / kg", min_value=0, step=500, value=0)
+            chicken_price = st.number_input("Harga Daging Ayam / Ayam Broiler / kg", min_value=0, step=500, value=0)
 
         source_note = st.text_input("Sumber/Catatan", value="Input Manual")
         submitted = st.form_submit_button("Simpan ke tabel")
@@ -345,7 +497,7 @@ def render_manual_input() -> None:
         if egg_price > 0:
             prices["Telur Ayam Ras"] = int(egg_price)
         if chicken_price > 0:
-            prices["Daging Ayam Ras"] = int(chicken_price)
+            prices["Daging Ayam / Ayam Broiler"] = int(chicken_price)
 
         if not prices:
             st.warning("Masukkan minimal satu harga yang lebih besar dari 0.")
@@ -366,7 +518,7 @@ def render_table_and_chart() -> None:
     min_date = min(df["tanggal"])
     max_date = max(df["tanggal"])
 
-    col1, col2, col3 = st.columns([1, 1, 1])
+    col1, col2, col3 = st.columns([1, 1, 1.3])
     with col1:
         start_date = st.date_input("Dari tanggal", value=min_date, format="YYYY-MM-DD")
     with col2:
@@ -383,7 +535,7 @@ def render_table_and_chart() -> None:
         & (df["tanggal"] <= end_date)
         & (df["komoditas"].isin(commodities))
     ].copy()
-    filtered = filtered.sort_values(["tanggal", "komoditas"], ascending=[False, True])
+    filtered = filtered.sort_values(["tanggal", "komoditas", "sumber"], ascending=[False, True, True])
 
     st.dataframe(
         filtered,
@@ -452,8 +604,10 @@ def render_sidebar() -> None:
         )
         st.warning(
             "Catatan: situs publik dapat mengubah struktur halaman sewaktu-waktu. "
-            "Jika otomatis gagal, tetap gunakan input manual atau sesuaikan parser."
+            "Jika otomatis gagal, gunakan input manual atau sesuaikan parser."
         )
+        st.markdown("**Sumber URL:**")
+        st.code(f"Simponi: {SIMPONI_URL}\nSP2KP: {SP2KP_URL}\nPIHPS: {PIHPS_URL}")
 
 
 def main() -> None:
